@@ -7,6 +7,7 @@ MAC(Multiply-Accumulate) 연산으로 입력 패턴이 Cross 필터와 X 필터 
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -71,7 +72,19 @@ class Matrix:
             for v in row:
                 if isinstance(v, bool) or not isinstance(v, (int, float)):
                     raise ValueError(f"{i + 1}번째 행에 숫자가 아닌 값: {v!r}")
+                to_finite_float(v, f"{i + 1}번째 행")
         return cls(n, rows)
+
+
+def to_finite_float(value, where="값"):
+    """유한한 float로 변환. 변환 불가·너무 큰 수·nan/inf면 ValueError."""
+    try:
+        f = float(value)
+    except OverflowError:
+        raise ValueError(f"{where}에 float 범위를 넘는 값") from None
+    if not math.isfinite(f):
+        raise ValueError(f"{where}에 유한하지 않은 값(nan/inf): {value!r}")
+    return f
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +120,12 @@ def normalize_label(raw):
 
 
 def judge(score_a, score_b, label_a, label_b, eps=EPSILON):
-    """epsilon 기반 비교. 차이가 eps 미만이면 None(동점)."""
+    """epsilon 기반 비교. 차이가 eps 미만이면 None(동점).
+
+    곱셈 누적이 overflow되어 점수가 inf/nan이 되면 비교 근거가 없으므로 None.
+    """
+    if not (math.isfinite(score_a) and math.isfinite(score_b)):
+        return None
     if abs(score_a - score_b) < eps:
         return None
     return label_a if score_a > score_b else label_b
@@ -175,14 +193,26 @@ def print_perf_table(sizes):
 # ---------------------------------------------------------------------------
 # 모드 1: 사용자 입력 (3×3)
 # ---------------------------------------------------------------------------
+GENERATORS = {"cross": make_cross, "x": make_x}
+
+
 def read_matrix(title, n=3):
-    """n줄을 입력받는다. 형식 오류면 안내 후 처음부터 다시 입력받는다."""
+    """n줄을 입력받는다. 형식 오류면 안내 후 처음부터 다시 입력받는다.
+
+    첫 줄에 'cross' 또는 'x'만 입력하면 패턴 생성기로 n×n 행렬을 만든다.
+    """
     while True:
-        print(f"{title} ({n}줄 입력, 공백 구분)")
+        print(f"{title} ({n}줄 입력, 공백 구분 | 'cross' 또는 'x' 입력 시 자동 생성)")
         rows = []
         error = None
-        for _ in range(n):
-            parts = input().split()
+        for line_no in range(n):
+            line = input()
+            if line_no == 0 and line.strip().lower() in GENERATORS:
+                m = GENERATORS[line.strip().lower()](n)
+                print(f"→ {normalize_label(line)} 패턴 자동 생성:")
+                print_matrix(m)
+                return m
+            parts = line.split()
             if len(parts) != n:
                 error = f"입력 형식 오류: 각 줄에 {n}개의 숫자를 공백으로 구분해 입력하세요."
                 break
@@ -190,6 +220,9 @@ def read_matrix(title, n=3):
                 rows.append([float(p) for p in parts])
             except ValueError:
                 error = "입력 형식 오류: 숫자만 입력하세요."
+                break
+            if not all(math.isfinite(v) for v in rows[-1]):
+                error = "입력 형식 오류: nan, inf는 사용할 수 없습니다. 유한한 숫자를 입력하세요."
                 break
         if error is None:
             return Matrix(n, rows)
@@ -221,7 +254,9 @@ def run_user_mode():
     print(f"A 점수: {score_a!r}")
     print(f"B 점수: {score_b!r}")
     print(f"연산 시간(평균/{REPEAT}회): {elapsed:.4f} ms")
-    if result is None:
+    if result is None and not (math.isfinite(score_a) and math.isfinite(score_b)):
+        print("판정: 판정 불가 (점수 overflow: inf/nan)")
+    elif result is None:
         print(f"판정: 판정 불가 (|A-B| < {EPSILON:g})")
     else:
         print(f"판정: {result}")
@@ -258,7 +293,7 @@ def load_filters(raw_filters):
                 raise ValueError(f"필터 누락: {', '.join(missing)}")
             filters[n] = loaded
             print(f"✓ {key:<8} 필터 로드 완료 ({LABEL_CROSS}, {LABEL_X})")
-        except (ValueError, TypeError, AttributeError) as e:
+        except (ValueError, TypeError, AttributeError, OverflowError) as e:
             print(f"✗ {key} 필터 로드 실패: {e}")
     return filters
 
@@ -291,7 +326,7 @@ def analyze_case(key, case, filters):
         cross_score = mac(pattern, filters[n][LABEL_CROSS])
         x_score = mac(pattern, filters[n][LABEL_X])
         decision = judge(cross_score, x_score, LABEL_CROSS, LABEL_X) or LABEL_UNDECIDED
-    except (ValueError, TypeError) as e:
+    except (ValueError, TypeError, OverflowError) as e:
         print(f"FAIL (스키마/데이터 오류: {e})")
         return False, f"스키마/데이터 오류 - {e}"
 
@@ -304,6 +339,8 @@ def analyze_case(key, case, filters):
 
     if passed:
         return True, None
+    if decision == LABEL_UNDECIDED and not (math.isfinite(cross_score) and math.isfinite(x_score)):
+        return False, f"점수 overflow(inf/nan)로 판정 불가 (Cross={cross_score!r}, X={x_score!r})"
     if decision == LABEL_UNDECIDED:
         return False, (f"동점(UNDECIDED) 처리 규칙에 따라 FAIL "
                        f"(Cross={cross_score!r}, X={x_score!r}, |차이| < {EPSILON:g})")
@@ -358,6 +395,49 @@ def run_json_mode(path=DATA_FILE):
 
 
 # ---------------------------------------------------------------------------
+# 모드 3 (보너스): 패턴 생성기
+# ---------------------------------------------------------------------------
+def read_size():
+    """2 이상의 정수 N을 입력받는다. 잘못된 값이면 재입력."""
+    while True:
+        raw = input("크기 N 입력 (2 이상 정수): ").strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            n = 0
+        if n >= 2:
+            if n % 2 == 0:
+                print(f"※ N이 짝수면 정중앙이 없어 Cross는 {n // 2}번째 행/열(0부터)을 기준으로 생성됩니다.")
+            return n
+        print("입력 형식 오류: 2 이상의 정수를 입력하세요.")
+
+
+def run_generator_mode():
+    section("[1] 크기 입력")
+    n = read_size()
+    cross, x = make_cross(n), make_x(n)
+
+    section(f"[2] 생성된 패턴 ({n}×{n})")
+    if n <= 13:
+        print("Cross:")
+        print_matrix(cross)
+        print("X:")
+        print_matrix(x)
+    else:
+        print(f"(N > 13은 출력 생략) Cross 1의 개수: {mac(cross, cross):g}, X 1의 개수: {mac(x, x):g}")
+
+    section("[3] MAC 결과 (생성 패턴 × 생성 필터)")
+    for name, pattern in ((LABEL_CROSS, cross), (LABEL_X, x)):
+        cs, xs = mac(pattern, cross), mac(pattern, x)
+        decision = judge(cs, xs, LABEL_CROSS, LABEL_X) or LABEL_UNDECIDED
+        status = "PASS" if decision == name else "FAIL"
+        print(f"{name} 패턴 → Cross 점수: {cs!r}, X 점수: {xs!r}, 판정: {decision} | {status}")
+
+    section(f"[4] 성능 분석 (평균/{REPEAT}회)")
+    print_perf_table((n,))
+
+
+# ---------------------------------------------------------------------------
 # 진입점
 # ---------------------------------------------------------------------------
 def main():
@@ -365,15 +445,14 @@ def main():
     print("\n[모드 선택]")
     print("1. 사용자 입력 (3x3)")
     print("2. data.json 분석")
+    print("3. 패턴 생성기 (N×N, 보너스)")
+    modes = {"1": run_user_mode, "2": run_json_mode, "3": run_generator_mode}
     while True:
         choice = input("선택: ").strip()
-        if choice == "1":
-            run_user_mode()
+        if choice in modes:
+            modes[choice]()
             return
-        if choice == "2":
-            run_json_mode()
-            return
-        print("1 또는 2를 입력하세요.")
+        print("1, 2, 3 중 하나를 입력하세요.")
 
 
 if __name__ == "__main__":
